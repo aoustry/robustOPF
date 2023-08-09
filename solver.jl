@@ -9,12 +9,13 @@ time_from_now(seconds) = round(Int, 10^9 * seconds + time_ns())
 
 function load_uncertainty_matrix_and_scale_factor(name,nbus)
     if name*".jld" in readdir("data/")
-        A = load("data/"*name*".jld")["data"] ;  
-        println("Loading matrix A")  ; 
+        A = load("data/"*name*".jld")["data"] ;
+        println("Loading matrix A")  ;
         magnitude = (load("data/"*name*"_mag.jld")["data"]);
-        return A,magnitude
+        println(magnitude)
+        return A, magnitude
     end
-        println("Creating matrix A") 
+        println("Creating matrix A")
         Random.seed!(0000);
         M= rand(nbus,nbus);
         Q, _ = qr(M);
@@ -30,17 +31,21 @@ function iterative_discretization(case,line_constraints,scaling)
     """Problem Data """
     model = ExaPF.PolarFormRecourse(case,1);
     basis = ExaPF.PolarBasis(model);
-    map_x = ExaPF.mapping(model, State()); map_x_no_delta = map_x[1:length(map_x)-1] ; map_u = ExaPF.mapping(model, Control());
-    mapmain = [map_x_no_delta;map_u];
-    nx,nu = length(map_x), length(map_u); N = nx -1 + nu;
+    map_x = ExaPF.mapping(model, State())
+    map_x_no_delta = map_x[1:length(map_x)-1]
+    map_u = ExaPF.mapping(model, Control())
+
+    mapmain = [map_x_no_delta; map_u];
+    nx,nu = length(map_x), length(map_u)
+    N = nx -1 + nu;
     ngen = PS.get(model, PS.NumberOfGenerators())
     nbus = PS.get(model, PS.NumberOfBuses())
     stack_refcase = ExaPF.NetworkStack(model)
     pload_refcase = stack_refcase.pload |> Array
     qload_refcase = stack_refcase.qload |> Array
-    aux_loadflow_array = [build_aux_loadflow(model,basis,line_constraints) for i in 1:Kthreads]
+    evaluators = [OracleEvaluator(model,1; line_constraints=line_constraints) for i in 1:Kthreads]
     array = split(case,"/")
-    
+
     if GaussianLowRand
         A,scale_factor = load_uncertainty_matrix_and_scale_factor(array[length(array)],nbus)
         magnitude = percentage_std * scale_factor
@@ -48,7 +53,7 @@ function iterative_discretization(case,line_constraints,scaling)
         avgstd = compute_std_sample(law_array[1],100000)
         avgstd = round(avgstd*1000)/1000;
         println("Law std = ",avgstd)
-        
+
     else
         println("Standard error remains to be computed")
         magnitude  = avgstd  = percentage_std*0.01
@@ -60,19 +65,18 @@ function iterative_discretization(case,line_constraints,scaling)
         law_array = [GaussianEqualCorrelation(dis_array[i],C,pload_refcase,qload_refcase,magnitude) for i in 1:Kthreads]
     end
 
-    
     logs = Dict("objective_scaling"=>scaling,"line_constraints"=>line_constraints,"avgstd"=>avgstd,"tol_ineq" => tol_ineq, "Ntries" => Ntries, "K" =>  Kthreads, "magnitude" => magnitude,"time_master"=>[], "time_oracle"=>[],"value_master"=> [],"stat_oracle"=> [],"size_scenarios"=> []);
 
     """Data structures """
     stack_main = ExaPF.NetworkStack(model)
-    """ Initialization with random scenarios, solve the batch""" 
+    """ Initialization with random scenarios, solve the batch"""
     p_total,q_total = hcat(pload_refcase), hcat(qload_refcase);
     warm_start_dict = Dict();
     warm_start_dict["bool"] = false;
     mtime = @elapsed begin
-    output = (solve_corrective_opf_ipopt(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min,scaling))
-    println(output)
-    obj_value_no_sip = output.obj_val;
+        output = (solve_corrective_opf_ipopt(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min,scaling))
+        # output = (solve_corrective_opf(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min))
+        obj_value_no_sip = output.obj_val;
     end
     log_info(logs,mtime,0.0,obj_value_no_sip,1,size(p_total,2));
     sol_master = output.model
@@ -81,30 +85,30 @@ function iterative_discretization(case,line_constraints,scaling)
     eigvals = []
     stack_main.input[1:nbus] .= sol_master_stack.vmag[1:nbus]
     stack_main.input[nbus+1:2*nbus] .= sol_master_stack.vang[1:nbus]
-    stack_main.input[2*nbus+2+ngen:end] .=sol_master_stack.pgen[1:ngen]
-    outer_iter_counter = 0 ;
-    counter_infeas = 0; 
-    threshold = 1e3 * tol_ineq;
-    obj_value = obj_value_no_sip;
+    stack_main.input[2*nbus+2+ngen:end] .= sol_master_stack.pgen[1:ngen]
+    outer_iter_counter = 0
+    counter_infeas = 0
+    threshold = 1e3 * tol_ineq
+    obj_value = obj_value_no_sip
     n_newbatch = 0;
     end_time = time_from_now(5*3600)
     while outer_iter_counter<MAXIT
         outer_iter_counter +=1
         otime = @elapsed begin
-        println("Threshold = ",threshold);
-        res = OracleParallel(stack_main.input,law_array,size_batch,aux_loadflow_array,Ntries,threshold)
+            println("Threshold = ",threshold);
+            res = OracleParallel(model, evaluators, stack_main.input,law_array,size_batch,Ntries,threshold)
         end
-            p_newbatch = res["pl_batch"];
-            q_newbatch = res["ql_batch"];
-            measured_ratio = res["ratio"];
-            eigvals = [eigvals; res["eigvals"]]
-            println("empirical frequency = ",measured_ratio)
-            n_newbatch = res["len"];
-            boolean = res["boolean"];
+        p_newbatch = res["pl_batch"];
+        q_newbatch = res["ql_batch"];
+        measured_ratio = res["ratio"];
+        eigvals = [eigvals; res["eigvals"]]
+        println("empirical frequency = ",measured_ratio)
+        n_newbatch = res["len"];
+        boolean = res["boolean"];
         if !(boolean)
             threshold = max(tol_ineq,threshold/4.0);
         end
-        if res["success"] == 0 
+        if res["success"] == 0
             log_info(logs,0.0,otime,obj_value,measured_ratio,size(p_total,2));
             array = split(case,"/");
             name = array[length(array)]
@@ -124,12 +128,12 @@ function iterative_discretization(case,line_constraints,scaling)
         warm_start_dict = Dict();
         warm_start_dict["bool"] = WARMSTART;
         if WARMSTART
-            x_batches = EvalXbatch(stack_main.input,n_newbatch,p_newbatch,q_newbatch,aux_loadflow_array[1]);
+            x_batches = EvalXbatch(model, evaluators[1], stack_main.input,n_newbatch,p_newbatch,q_newbatch);
             warm_start_dict["x0"] = vcat(sol_master_stack.input[sol_master.blk_mapx],x_batches,sol_master_stack.input[sol_master.blk_mapu[1:nu]])
         end
         mtime = @elapsed begin
-        #output = (solve_corrective_opf(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min))
-        output = (solve_corrective_opf_ipopt(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min,scaling))
+            # output = (solve_corrective_opf(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min))
+            output = (solve_corrective_opf_ipopt(case,p_total,q_total,line_constraints,warm_start_dict,barrier_min,scaling))
         end
         if output.status==MOI.LOCALLY_INFEASIBLE
             counter_infeas+=1;
@@ -145,7 +149,8 @@ function iterative_discretization(case,line_constraints,scaling)
         sol_master_stack = output.model.stack
         stack_main.input[1:nbus] .= sol_master_stack.vmag[1:nbus]
         stack_main.input[nbus+1:2*nbus] .= sol_master_stack.vang[1:nbus]
-        stack_main.input[2*nbus+2+ngen:end] .=sol_master_stack.pgen[1:ngen]
+        stack_main.input[2*nbus+2+ngen:end] .= sol_master_stack.pgen[1:ngen]
+        @info(stack_main.pgen[1:10])
        ##########################################################################################################################
         obj_value = output.obj_val;
         println("Obj value = ", obj_value)

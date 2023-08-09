@@ -1,6 +1,6 @@
 
 
-abstract type LoadProbabilityLaw end 
+abstract type LoadProbabilityLaw end
 #Structure of random laws to refine
 mutable struct GaussianIndependantLaw <: LoadProbabilityLaw
     pload_ref::Vector{Float64}
@@ -17,25 +17,25 @@ mutable struct GaussianIndependantLowRank<: LoadProbabilityLaw
 end
 
 mutable struct GaussianEqualCorrelation<: LoadProbabilityLaw
-    d::Distribution 
+    d::Distribution
     C::Matrix{Float64}
     pload_ref::Vector{Float64}
     qload_ref::Vector{Float64}
     sigma::Float64
 end
 
-function sample(law::GaussianIndependantLaw)
+function sample(law::GaussianIndependantLaw, k=1)
     nbus = length(law.pload_ref);
     has_load = (law.pload_ref .> 0);
-    pload = law.sigma .* (randn(nbus) .* has_load) .+ law.pload_ref
-    qload = law.sigma .* (randn(nbus) .* has_load) .+ law.qload_ref
-    return pload,qload
+    pload = law.sigma .* (randn(nbus, k) .* has_load) .+ law.pload_ref
+    qload = law.sigma .* (randn(nbus, k) .* has_load) .+ law.qload_ref
+    return pload, qload
 end
 
-function sample(law::GaussianIndependantLowRank)
-    normal = randn(law.rank)
+function sample(law::GaussianIndependantLowRank, k=1)
+    normal = randn(law.rank, k)
     while norm(normal,2)*norm(normal,2) > 2*law.rank
-        normal = randn(law.rank)
+        normal = randn(law.rank, k)
     end
     mod_coeff = law.sigma .* (law.A*normal)
     #println(mod_coeff);

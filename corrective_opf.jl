@@ -3,9 +3,8 @@ using Random
 using NLPModels
 using Argos
 using MadNLP
-using MadNLPHSL
+# using MadNLPHSL
 using Ipopt
-using KNITRO
 #using MathOptInterface
 const MOI =MathOptInterface
 
@@ -31,7 +30,7 @@ end
 function solve_corrective_opf(case,pl,ql,line_co,warm_start_dict,barrier_min=1e-10)
     #model = ExaPF.PolarForm(case)
     ev = Argos.CorrectiveEvaluator(case, pl, ql; line_constraints=line_co, epsilon=SMOOTHING_PARAM)
-    blk = Argos.OPFModel(ev)    
+    blk = Argos.OPFModel(ev)
     instantiate!(blk)
     if warm_start_dict["bool"]
         lenx0 = length(blk.meta.x0);
@@ -57,11 +56,11 @@ end
 function solve_corrective_opf_ipopt(case,pl,ql,line_co,warm_start_dict,barrier_min,scaling)
     #model = ExaPF.PolarForm(case)
     ev = Argos.CorrectiveEvaluator(case, pl, ql; line_constraints=line_co, epsilon=SMOOTHING_PARAM)
-    blk = Argos.OPFModel(ev)    
+    blk = Argos.OPFModel(ev)
     instantiate!(blk)
     knitro =false
     if knitro
-        optimizer = KNITRO.Optimizer()  
+        optimizer = KNITRO.Optimizer()
         MOI.set(optimizer,MOI.RawOptimizerAttribute("bar_initmu"),barrier_min)
         MOI.set(optimizer,MOI.RawOptimizerAttribute("maxit"), 1000)
 
@@ -74,8 +73,9 @@ function solve_corrective_opf_ipopt(case,pl,ql,line_co,warm_start_dict,barrier_m
         #MOI.set(optimizer,MOI.RawOptimizerAttribute("objscalefactor"),scaling)
 
     else
-        optimizer = Ipopt.Optimizer() 
+        optimizer = Ipopt.Optimizer()
         MOI.set(optimizer,MOI.RawOptimizerAttribute("max_iter"), 250)
+        MOI.set(optimizer,MOI.RawOptimizerAttribute("tol"), 1e-3)
         MOI.set(optimizer,MOI.RawOptimizerAttribute("mu_init"), 100*barrier_min)
         MOI.set(optimizer,MOI.RawOptimizerAttribute("mu_target"), barrier_min)
         MOI.set(optimizer,MOI.RawOptimizerAttribute("obj_scaling_factor"), scaling)

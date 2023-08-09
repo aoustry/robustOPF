@@ -1,5 +1,8 @@
 
 using Arpack
+using SparseArrays
+using KLU
+const LS = ExaPF.LinearSolvers
 
 
 function spectral_evaluation(JtopJ)
@@ -17,169 +20,115 @@ function pvalue(N,p0,success)
     println("pvalue for rejection p ≥ p0 =",sum)
 end
 
+struct OracleEvaluator
+    batch_model::ExaPF.PolarFormRecourse
+    jac::ExaPF.Jacobian
+    stack::ExaPF.NetworkStack
+    constraints::ExaPF.ComposedExpressions
+    solver::ExaPF.NewtonRaphson
+    linear_solver::Any
+end
 
-
-function build_aux_loadflow(model_ext_oracle,basis,line_constraints)
+function OracleEvaluator(model_ext_oracle, k; line_constraints=false)
+    batch_model = ExaPF.PolarFormRecourse(model_ext_oracle.network, CPU(), k)
     mapx = ExaPF.mapping(model_ext_oracle, State())
-    mapu = ExaPF.mapping(model_ext_oracle, Control())
-    stack_ext_oracle = ExaPF.NetworkStack(model_ext_oracle)
-    pf_recourse = ExaPF.PowerFlowRecourse(model_ext_oracle,epsilon = SMOOTHING_PARAM) ∘ basis
-    jacx_ext_oracle = ExaPF.Jacobian(model_ext_oracle, pf_recourse, mapx)
-    jacu_ext_oracle = ExaPF.Jacobian(model_ext_oracle, pf_recourse, mapu)
+    stack_ext_oracle = ExaPF.NetworkStack(batch_model)
+    basis = ExaPF.PolarBasis(batch_model)
+    pf_recourse = ExaPF.PowerFlowRecourse(batch_model, epsilon=SMOOTHING_PARAM) ∘ basis
+    jacx_ext_oracle = ExaPF.Jacobian(batch_model, pf_recourse, mapx)
     constraints_expr = Any[
-            ExaPF.ReactivePowerBounds(model_ext_oracle),
-        ]
+        ExaPF.ReactivePowerBounds(batch_model),
+    ]
     if line_constraints
-            push!(constraints_expr, ExaPF.LineFlows(model_ext_oracle))
+        push!(constraints_expr, ExaPF.LineFlows(batch_model))
     end
-    constraints = ExaPF.MultiExpressions(constraints_expr)∘ basis
-    jacx_ineq_constraints = ExaPF.Jacobian(model_ext_oracle, constraints, mapx)
-    jacu_ineq_constraints = ExaPF.Jacobian(model_ext_oracle, constraints, mapu)
-    return (model_ext_oracle,stack_ext_oracle,constraints,jacx_ext_oracle,jacu_ext_oracle,jacx_ineq_constraints,jacu_ineq_constraints) 
+    constraints = ExaPF.MultiExpressions(constraints_expr) ∘ basis
+    solver = ExaPF.NewtonRaphson(; verbose=0)
+
+    linear_solver = LS.DirectSolver(klu(jacx_ext_oracle.J))
+    return OracleEvaluator(batch_model, jacx_ext_oracle, stack_ext_oracle, constraints, solver, linear_solver)
 end
 
-function Oracle(input_bar,law::LoadProbabilityLaw,batch_size::Integer,aux_loadflow,N_tries)
-    """Input bar est le vecteur d'initalisation de la méthode de Newton """
-    model_loadflow,stack_loadflow,constraints,jacx_loadflow,_,_,_ = aux_loadflow
-    bmin, bmax = ExaPF.bounds(model_loadflow, stack_loadflow);
-    gmin,gmax = ExaPF.bounds(model_loadflow, constraints);
-    map_x = ExaPF.mapping(model_loadflow, State())
-    map_x_no_delta = map_x[1:length(map_x)-1] 
-    solver = ExaPF.NewtonRaphson(; verbose=0)
-    nbus = length(stack_loadflow.pload);
-    success,tries = 0,0;
-    pl_batch,ql_batch = [],[];
-    N = length(stack_loadflow.input)
-    while success<batch_size && (tries<N_tries)
-        tries+=1;
-        pl,ql = sample(law);
-        stack_loadflow.input[1:N] = input_bar;
-        stack_loadflow.pload[1:nbus] = pl ;
-        stack_loadflow.qload[1:nbus] = ql ;
-        ExaPF.set_params!(jacx_loadflow, stack_loadflow);
-        ExaPF.nlsolve!(solver, jacx_loadflow, stack_loadflow);
-        cons_eval = constraints(stack_loadflow);
-        v_bmin,vbmax = maximum((bmin - stack_loadflow.input)[map_x_no_delta]), maximum((stack_loadflow.input - bmax)[map_x_no_delta]);
-        v_gmin, v_gmax = maximum(gmin - cons_eval), maximum(cons_eval - gmax);
-        error = maximum([v_bmin,vbmax,v_gmin,v_gmax]);
-        #println(error)
-        if error>tol_ineq
-            success+=1
-            if length(pl_batch)==0
-                pl_batch = pl
-                ql_batch = ql
-            else
-                pl_batch = hcat(pl_batch, pl);
-                ql_batch = hcat(ql_batch, ql);
-            end
-        end
-    end
-    println("Oracle : tries = ",tries, ", new scenarios = ", success,"." )
-    ratio = success/tries
-    return pl_batch,ql_batch,ratio
+function LS.update!(s::LS.DirectSolver{KLU.KLUFactorization{Tv, Ti}}, J::SparseMatrixCSC{Tv, Ti}) where {Tv, Ti}
+    klu!(s.factorization, J)
 end
 
-function Oracle2(input_bar,law::LoadProbabilityLaw,batch_size::Integer,aux_loadflow,N_tries,threshold)
-    """Input bar est le vecteur d'initalisation de la méthode de Newton """
-    model_loadflow,stack_loadflow,constraints,jacx_loadflow,_,_,_ = aux_loadflow
-    bmin, bmax = ExaPF.bounds(model_loadflow, stack_loadflow);
-    gmin,gmax = ExaPF.bounds(model_loadflow, constraints);
-    map_x = ExaPF.mapping(model_loadflow, State())
-    map_x_no_delta = map_x[1:length(map_x)-1] 
-    solver = ExaPF.NewtonRaphson(; verbose=0)
-    nbus = length(stack_loadflow.pload);
-    success,tries = 0,0;
-    pl_batch,ql_batch = [],[];
-    N = length(stack_loadflow.input)
-    while success<batch_size && (tries<N_tries)
-        tries+=1;
-        pl,ql = sample(law);
-        stack_loadflow.input[1:N] = input_bar;
-        stack_loadflow.pload[1:nbus] = pl ;
-        stack_loadflow.qload[1:nbus] = ql ;
-        ExaPF.set_params!(jacx_loadflow, stack_loadflow);
-        ExaPF.nlsolve!(solver, jacx_loadflow, stack_loadflow);
-        cons_eval = constraints(stack_loadflow);
-        v_bmin,vbmax = maximum((bmin - stack_loadflow.input)[map_x_no_delta]), maximum((stack_loadflow.input - bmax)[map_x_no_delta]);
-        v_gmin, v_gmax = maximum(gmin - cons_eval), maximum(cons_eval - gmax);
-        error = maximum([v_bmin,vbmax,v_gmin,v_gmax]);
-        #println(error)
-        if error>threshold
-            success+=1
-            if length(pl_batch)==0
-                pl_batch = pl
-                ql_batch = ql
-            else
-                pl_batch = hcat(pl_batch, pl);
-                ql_batch = hcat(ql_batch, ql);
-            end
+function get_feasibility_bounds!(inf_pr, vmag, vmag_min, vmag_max, pq, nbus, k)
+    @inbounds for i in 1:k
+        for j in pq
+            dlb = vmag_min[j] - vmag[j + (i-1) * nbus]
+            dub = vmag[j + (i-1) * nbus] - vmag_max[j]
+            inf_pr[k] = max(inf_pr[k], dlb, dub)
         end
     end
-    println("Oracle : tries = ",tries, ", new scenarios = ", success,"." )
-    ratio = success/tries
-    return pl_batch,ql_batch,ratio,success
+    return
 end
 
-function Oracle3(input_bar,law::LoadProbabilityLaw,batch_size::Integer,aux_loadflow,N_tries,threshold,threadid)
-    """Input bar est le vecteur d'initalisation de la méthode de Newton """
-    model_loadflow,stack_loadflow,constraints,jacx_loadflow,_,_,_ = aux_loadflow
-    bmin, bmax = ExaPF.bounds(model_loadflow, stack_loadflow);
-    gmin,gmax = ExaPF.bounds(model_loadflow, constraints);
-    map_x = ExaPF.mapping(model_loadflow, State())
-    map_x_no_delta = map_x[1:length(map_x)-1] 
-    solver = ExaPF.NewtonRaphson(; verbose=0)
-    nbus = length(stack_loadflow.pload);
-    success_threshold,success,tries = 0,0,0;
-    pl_batch,ql_batch, error_batch = [],[],[];
-    pl_log,ql_log,error_log = [],[],[];
-    eigvals = [];
-    N = length(stack_loadflow.input)
-    while success_threshold<batch_size && (tries<N_tries)
-        #println(threadid," ",tries," ",success)
-        tries+=1;
-        pl,ql = sample(law);
-        stack_loadflow.input[1:N] = input_bar;
-        stack_loadflow.pload[1:nbus] = pl ;
-        stack_loadflow.qload[1:nbus] = ql ;
-        ExaPF.set_params!(jacx_loadflow, stack_loadflow);
-        ExaPF.nlsolve!(solver, jacx_loadflow, stack_loadflow);
-
-        if TEST_EIG_VAL
-            jacobian = ExaPF.jacobian!(jacx_loadflow,stack_loadflow);
-            JtopJ = jacobian'*jacobian;
-            eigvals = [eigvals;(spectral_evaluation(JtopJ))];
-        end
-
-        cons_eval = constraints(stack_loadflow);
-        v_bmin,vbmax = maximum((bmin - stack_loadflow.input)[map_x_no_delta]), maximum((stack_loadflow.input - bmax)[map_x_no_delta]);
-        v_gmin, v_gmax = maximum(gmin - cons_eval), maximum(cons_eval - gmax);
-        error = maximum([v_bmin,vbmax,v_gmin,v_gmax]);
-        if error>tol_ineq
-            success+=1
-        end
-        if error>threshold
-            success_threshold+=1
-            if length(pl_batch)==0
-                pl_batch = pl
-                ql_batch = ql
-                error_batch = [error];
-            else
-                pl_batch = hcat(pl_batch, pl);
-                ql_batch = hcat(ql_batch, ql);
-                error_batch = [error_batch;error];
-            end
-        elseif error>tol_ineq
-            if length(pl_log)==0
-                pl_log = pl;
-                ql_log = ql;
-                error_log = [error];
-            else
-                error_log = [error_log;error];
-                pl_log = hcat(pl_log, pl);
-                ql_log = hcat(ql_log, ql);
-            end
+function get_feasibility_constraints!(inf_pr, g, gmin, gmax, k)
+    m = div(length(gmin), k)
+    @inbounds for i in 1:k
+        for j in 1:m
+            dlb = gmin[j] - g[j + (i-1) * m]
+            dub = g[j + (i-1) * m] - gmax[j]
+            inf_pr[k] = max(inf_pr[k], dlb, dub)
         end
     end
+    return
+end
+
+function assess!(
+    model::ExaPF.PolarFormRecourse,
+    ev::OracleEvaluator,
+    input_bar,
+    law::LoadProbabilityLaw,
+    batch_size::Integer,
+    N_tries,
+    threshold,
+    threadid,
+)
+
+    vmag_min, vmag_max = PS.bounds(model.network, PS.Buses(), PS.VoltageMagnitude())
+    gmin, gmax = ExaPF.bounds(ev.batch_model, ev.constraints)
+    cons_eval = similar(gmin)
+
+    inf_pr = zeros(model.k)
+    nbus = length(ev.stack.pload)
+    success_threshold, success, tries = (0, 0, 0)
+
+    pl_batch, ql_batch, error_batch = zeros(nbus, 0),zeros(nbus, 0),Float64[]
+    pl_log, ql_log, error_log = zeros(nbus, 0),zeros(nbus, 0),Float64[]
+    N = length(ev.stack.input)
+    while success_threshold < batch_size && (tries < N_tries)
+        tries += ev.batch_model.k
+        pl, ql = sample(law, ev.batch_model.k)
+        ev.stack.input[1:N] .= input_bar
+
+        ExaPF.set_params!(ev.stack, pl, ql)
+        ExaPF.set_params!(ev.jac, ev.stack)
+        ExaPF.nlsolve!(ev.solver, ev.jac, ev.stack; linear_solver=ev.linear_solver)
+
+        ev.constraints(cons_eval, ev.stack)
+        fill!(inf_pr, 0.0)
+        get_feasibility_bounds!(inf_pr, ev.stack.vmag, vmag_min, vmag_max, model.network.pq, nbus, model.k)
+        get_feasibility_constraints!(inf_pr, cons_eval, gmin, gmax, model.k)
+
+        infeas = findall(inf_pr .> threshold)
+        if length(infeas) >= 1
+            success_threshold += length(infeas)
+            pl_batch = hcat(pl_batch, pl[:, infeas])
+            ql_batch = hcat(ql_batch, ql[:, infeas])
+            push!(error_batch, inf_pr[infeas])
+        end
+
+        infeas_ineq = findall(threshold .> inf_pr .> tol_ineq)
+        if length(infeas_ineq) >= 1
+            success += length(infeas_ineq)
+            push!(error_log, inf_pr[infeas_ineq]...)
+            pl_log = hcat(pl_log, pl[:, infeas_ineq])
+            ql_log = hcat(ql_log, ql[:, infeas_ineq])
+        end
+    end
+
     len = success_threshold
     if (success_threshold<batch_size) && length(error_log)>0
         #Complement with smaller
@@ -205,12 +154,12 @@ function Oracle3(input_bar,law::LoadProbabilityLaw,batch_size::Integer,aux_loadf
     return res
 end
 
-function OracleParallel(input_bar,law_array,batch_size::Integer,aux_loadflow_array,N_tries,threshold)
+function OracleParallel(model, evaluators, input_bar,law_array,batch_size::Integer,N_tries,threshold)
     res = [Dict() for i in 1:Kthreads]
     small_batch_size = Integer(max(1,round(batch_size/Kthreads)))
     #for i = 1:Kthreads
     Threads.@threads for i = 1:Kthreads
-        res[i] = Oracle3(input_bar,law_array[i],small_batch_size,aux_loadflow_array[i],N_tries/Kthreads,threshold,Threads.threadid())
+        res[i] = assess!(model, evaluators[i], input_bar,law_array[i],small_batch_size,N_tries/Kthreads,threshold,Threads.threadid())
     end
     len = minimum([batch_size,sum(dico["len"] for dico in res)])
     success = sum(dico["success"] for dico in res)
@@ -219,7 +168,7 @@ function OracleParallel(input_bar,law_array,batch_size::Integer,aux_loadflow_arr
     tuples = [(e,i,j) for i in 1:Kthreads for (j,e) in enumerate(res[i]["error_batch"])]
     sorted = sort(tuples,rev=true);
     boolean = maximum([dico["boolean"] for dico in res])
-    eigvals = res[1]["eigvals"] 
+    eigvals = res[1]["eigvals"]
     output = Dict("ratio"=>measured_ratio,"len"=>len,"success"=>success,"tries"=>tries,"boolean"=>boolean,"error_batch"=>[res[s[2]]["error_batch"][s[3]] for s in sorted[1:len]],"eigvals"=>eigvals)
     if len >0
         output["pl_batch"] = reduce(hcat,[res[s[2]]["pl_batch"][:,s[3]] for s in sorted[1:len]]);
